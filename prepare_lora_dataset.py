@@ -37,6 +37,17 @@ except ImportError:
     print("ERROR: missing dependencies. Run: pip install librosa soundfile numpy")
     sys.exit(1)
 
+# Optional: beat-this neural beat tracker (much more accurate than librosa)
+# Loads silently — falls back to IOI/librosa if not installed or model not downloaded
+try:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        from beat_this.inference import File2Beats as _BeatThis
+    _BEAT_THIS_AVAILABLE = True
+except Exception:
+    _BEAT_THIS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -108,58 +119,131 @@ def loop_to_length(y, sr, target_seconds=TARGET_LOOP_SECONDS):
     return out[:target_len]
 
 
-def detect_bpm(y, sr):
+def detect_bpm(y, sr, audio_path=None):
     """
-    Multi-Candidate Harmonic BPM Resolution.
+    4-Tier BPM Detection (best → fallback):
 
-    Problem: librosa's beat_track locks onto triplet subdivisions on complex
-    Indian/Bollywood percussion, returning 133 BPM when the true tempo is 100 BPM
-    (because 100 × 4/3 ≈ 133).
+    Tier 1 — beat-this Neural Transformer (kits.ai-class accuracy)
+             Uses a pre-trained Transformer model trained on 1,000+ annotated
+             tracks. Same technology class as commercial tools like kits.ai.
+             Requires: `beat-this` package + model weights (~77MB, auto-downloads).
 
-    Solution:
-      1. Extract the top-N tempo candidates from the tempogram.
-      2. For each candidate, generate its harmonic family (×2, ÷2, ×2/3, ×3/4, ×3/2).
-      3. Resolve to the candidate in the 60–145 BPM "musical zone" whose harmonic
-         family has the highest combined tempogram energy — i.e., the true fundamental.
+    Tier 2 — IOI Histogram (DAW method)
+             Measures actual time gaps between detected beat events.
+             Immune to spectral aliasing (4:3, 2:1 ratio errors).
+
+    Tier 3 — Onset-strength Autocorrelation
+             Finds the most repeating periodicity in the onset signal.
+
+    Tier 4 — librosa standard beat_track (absolute fallback)
+
+    All results are normalised into the 60–160 BPM musical zone.
     """
-    hop_length  = 512
-    onset_env   = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
-    tg          = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr,
-                                            hop_length=hop_length)
-    tg_mean     = np.mean(tg, axis=1)
-    bpm_axis    = librosa.tempo_frequencies(tg.shape[0], hop_length=hop_length, sr=sr)
+    MUSICAL_LOW  = 60
+    MUSICAL_HIGH = 160
 
-    # Keep only the musical range 50–200 BPM
-    mask        = (bpm_axis >= 50) & (bpm_axis <= 200)
-    tg_m        = tg_mean[mask]
-    bpms        = bpm_axis[mask]
+    def normalise_to_range(bpm, lo=MUSICAL_LOW, hi=MUSICAL_HIGH):
+        """Halve or double until BPM is inside [lo, hi]."""
+        while bpm > hi:
+            bpm /= 2.0
+        while bpm < lo:
+            bpm *= 2.0
+        return bpm
 
-    # Top-16 candidates by tempogram energy
-    top_idx     = np.argsort(tg_m)[-16:][::-1]
-    candidates  = bpms[top_idx]
+    # ── Tier 1: beat-this Neural Transformer ─────────────────────────────────
+    if _BEAT_THIS_AVAILABLE and audio_path is not None:
+        try:
+            import warnings, numpy as _np
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                _f2b = _BeatThis(device='cpu', dbn=False)
+                beats, _ = _f2b(str(audio_path))
+            if len(beats) > 1:
+                bpm_nn = 60.0 / _np.median(_np.diff(beats))
+                return round(float(normalise_to_range(bpm_nn)), 1)
+        except Exception as e:
+            print(f"Beat-this failed: {e}")
+            pass  # Fall through to Tier 2
 
-    def family_energy(bpm):
-        """Sum tempogram energy for bpm and all its harmonic relatives."""
-        relatives = [bpm, bpm * 2, bpm / 2,
-                     bpm * 2 / 3, bpm * 3 / 2,
-                     bpm * 3 / 4, bpm * 4 / 3]
-        total = 0.0
-        for r in relatives:
-            if r < 50 or r > 200:
+
+    ioi_votes = {}
+    for hop in [128, 256, 512]:
+        onsets = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop,
+                                            backtrack=True, units='time')
+        if len(onsets) < 4:
+            continue
+        # Inter-onset intervals in seconds
+        iois = np.diff(onsets)
+        iois = iois[(iois > 0.15) & (iois < 2.5)]  # keep 24–400 BPM range
+        if len(iois) == 0:
+            continue
+        # Convert each gap to BPM and normalise
+        for gap in iois:
+            raw_bpm = 60.0 / gap
+            bpm_n   = normalise_to_range(raw_bpm)
+            bucket  = round(bpm_n / 2) * 2  # 2-BPM buckets
+            ioi_votes[bucket] = ioi_votes.get(bucket, 0) + 1
+
+    # ── Method 2: Onset-strength Autocorrelation (secondary) ─────────────────
+    acf_votes = {}
+    for hop in [256, 512]:
+        onset_env  = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+        # Autocorrelate to find periodicity
+        acf        = librosa.autocorrelate(onset_env, max_size=sr // hop * 4)
+        frame_rate = sr / hop
+        # Frame lags → BPM
+        for lag in range(int(frame_rate * 60 / MUSICAL_HIGH),
+                         int(frame_rate * 60 / MUSICAL_LOW) + 1):
+            if lag <= 0 or lag >= len(acf):
                 continue
-            idx = np.argmin(np.abs(bpms - r))
-            total += tg_m[idx]
-        return total
+            bpm_n  = normalise_to_range(60.0 * frame_rate / lag)
+            bucket = round(bpm_n / 2) * 2
+            acf_votes[bucket] = acf_votes.get(bucket, 0) + float(acf[lag])
 
-    # Among candidates in the 60-145 BPM musical zone, pick the one whose
-    # harmonic family has the highest combined energy (= true fundamental)
-    musical_candidates = [b for b in candidates if 60 <= b <= 145]
-    if not musical_candidates:
-        musical_candidates = list(candidates)
+    # ── Consensus: combine votes ──────────────────────────────────────────────
+    # IOI votes carry 3× weight (it's the real measurement); ACF carries 1×
+    all_buckets = set(ioi_votes) | set(acf_votes)
+    if not all_buckets:
+        # Absolute fallback: librosa standard
+        tempo_arr, _ = librosa.beat.beat_track(y=y, sr=sr)
+        raw = float(np.squeeze(tempo_arr))
+        return round(normalise_to_range(raw), 1)
 
-    best_bpm    = max(musical_candidates, key=family_energy)
+    combined = {b: ioi_votes.get(b, 0) * 3 + acf_votes.get(b, 0)
+                for b in all_buckets}
+
+    best_bpm = max(combined, key=combined.get)
     return round(float(best_bpm), 1)
 
+
+def detect_time_signature(audio_path):
+    """
+    Extracts time signature by analyzing the spacing between downbeats
+    using the beat-this Neural Transformer. Returns '4/4', '3/4', etc.
+    """
+    if _BEAT_THIS_AVAILABLE and audio_path is not None:
+        try:
+            import warnings, numpy as _np
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                _f2b = _BeatThis(device='cpu', dbn=False)
+                beats, downbeats = _f2b(str(audio_path))
+            
+            if len(beats) > 1 and downbeats is not None and len(downbeats) > 1:
+                beats_per_bar = []
+                for i in range(len(downbeats) - 1):
+                    db_start = downbeats[i]
+                    db_end = downbeats[i+1]
+                    count = sum(1 for b in beats if db_start <= b < db_end)
+                    beats_per_bar.append(count)
+                if beats_per_bar:
+                    ts = int(_np.median(beats_per_bar))
+                    # Prevent weird non-musical time signatures
+                    if ts not in [3, 4, 5, 6, 7]: ts = 4
+                    return f"{ts}/4"
+        except Exception:
+            pass
+    return "4/4"  # Default fallback
 
 
 def detect_key(y, sr):
@@ -212,7 +296,8 @@ def sanitize(text):
 # ---------------------------------------------------------------------------
 
 def process_directory(input_dir, output_dir, quarantine_dir,
-                      dataset_name="BollyHood Beats", max_duration_s=TARGET_LOOP_SECONDS):
+                      dataset_name="BollyHood Beats", max_duration_s=TARGET_LOOP_SECONDS,
+                      manual_bpm=None):
     os.makedirs(output_dir,   exist_ok=True)
     os.makedirs(quarantine_dir, exist_ok=True)
 
@@ -260,20 +345,57 @@ def process_directory(input_dir, output_dir, quarantine_dir,
             final_duration = round(len(y) / sr, 2)
 
             # 5. Intelligence extraction
-            bpm               = detect_bpm(y, sr)
+            # ── BPM Detection: Manual Override → Smart Hint → DSP Fallback ────
+            bpm = None
+            path_str = str(file_path)
+            stem = Path(file_path).stem  # filename without extension
+
+            # Priority 0: Manual override from UI (highest priority)
+            if manual_bpm is not None:
+                bpm = float(manual_bpm)
+
+            # Pass 1: explicit 'NNNbpm' tag in path
+            if bpm is None:
+                m = re.search(r'(\d{2,3})\s*bpm', path_str, re.IGNORECASE)
+                if m:
+                    bpm = float(m.group(1))
+
+            # Pass 2: trailing number in stem like "074 tabla 100" → 100
+            if bpm is None:
+                m2 = re.search(r'[\s_](\d{2,3})$', stem.strip())
+                if m2:
+                    candidate = int(m2.group(1))
+                    if 60 <= candidate <= 180:
+                        bpm = float(candidate)
+
+            # Pass 3: parent folder contains a standalone BPM number
+            if bpm is None:
+                folder_name = Path(file_path).parent.name
+                m3 = re.search(r'(?:^|[\s_])(\d{2,3})(?:[\s_]|bpm|$)', folder_name, re.IGNORECASE)
+                if m3:
+                    candidate = int(m3.group(1))
+                    if 60 <= candidate <= 180:
+                        bpm = float(candidate)
+
+            if bpm is None:
+                bpm = detect_bpm(y, sr, audio_path=file_path)
+            
+            # Extract Key/Scale and Time Signature
             key_label, key_root, key_mode = detect_key(y, sr)
             vibe, centroid_hz = detect_vibe(y, sr)
+            time_sig = detect_time_signature(audio_path=file_path)
 
             # 6. Caption
-            caption = (f"{dataset_name} {shape_tag}, {int(round(bpm))} BPM, "
-                       f"{key_root} {key_mode}, {vibe}")
+            caption = (f"{dataset_name} {shape_tag}, {int(round(bpm))} BPM, {time_sig} time, "
+                       f"Scale: {key_root} {key_mode}, Vibe: {vibe}")
 
             # 7. Smart rename
             stem = sanitize(Path(file_path).stem)
             safe_name = sanitize(dataset_name)
             key_safe  = key_root.replace("#", "sharp")
+            time_safe = time_sig.replace("/", "-")
             new_name  = (f"{safe_name}_{shape_tag}_{int(round(bpm))}bpm_"
-                         f"{key_safe}{key_mode}_{int(final_duration)}s_{stem}")
+                         f"{key_safe}{key_mode}_{time_safe}_{int(final_duration)}s_{stem}")
 
             out_wav  = os.path.join(output_dir, f"{new_name}.wav")
             out_json = os.path.join(output_dir, f"{new_name}.json")
@@ -288,7 +410,8 @@ def process_directory(input_dir, output_dir, quarantine_dir,
                 "renamed_file":       f"{new_name}.wav",
                 "dataset_name":       dataset_name,
                 "bpm":                bpm,
-                "key":                key_label,
+                "time_signature":     time_sig,
+                "key_scale":          f"{key_root} {key_mode}",
                 "duration_seconds":   final_duration,
                 "shape":              shape_tag,
                 "spectral_vibe":      vibe,
