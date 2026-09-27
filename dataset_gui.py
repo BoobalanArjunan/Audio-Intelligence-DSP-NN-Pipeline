@@ -3,7 +3,7 @@ from prepare_lora_dataset import process_directory
 import os
 
 
-def run_pipeline(input_dir, output_dir, quarantine_dir, dataset_name, max_duration, manual_bpm_raw):
+def run_pipeline(input_dir, output_dir, quarantine_dir, dataset_name, max_duration, manual_bpm_raw, enable_advanced_ui):
     if not all([input_dir, output_dir, quarantine_dir, dataset_name]):
         yield "❌ Error: Please fill in all directory and dataset name fields."
         return
@@ -31,7 +31,7 @@ def run_pipeline(input_dir, output_dir, quarantine_dir, dataset_name, max_durati
 
     for msg in process_directory(
         input_dir, output_dir, quarantine_dir, dataset_name, max_duration,
-        manual_bpm=manual_bpm
+        manual_bpm=manual_bpm, enable_advanced=enable_advanced_ui
     ):
         log_output += msg
         yield log_output
@@ -80,6 +80,13 @@ with gr.Blocks(title="Audio Intelligence DSP Pipeline — Boobalan Arjunan") as 
                      "This overrides ALL auto-detection and gives 100% accurate BPM labels. "
                      "Leave as 0 to use smart auto-detection from filename hints + DSP."
             )
+            
+            gr.Markdown("### 🧠 Section 4: Advanced AI Parameters")
+            enable_advanced_ui = gr.Checkbox(
+                label="Enable Advanced Deep DSP (HPSS & Density)", 
+                value=False, 
+                info="Adds 'Percussive/Harmonic' and 'Dense/Sparse' tags to your dataset. Takes slightly longer to compute."
+            )
 
             run_btn = gr.Button("🚀 Initialize DSP Engine", variant="primary", size="lg")
 
@@ -98,7 +105,7 @@ with gr.Blocks(title="Audio Intelligence DSP Pipeline — Boobalan Arjunan") as 
 
     run_btn.click(
         fn=run_pipeline,
-        inputs=[input_dir, output_dir, quarantine_dir, dataset_name, max_duration, manual_bpm_input],
+        inputs=[input_dir, output_dir, quarantine_dir, dataset_name, max_duration, manual_bpm_input, enable_advanced_ui],
         outputs=[console_output]
     )
 
