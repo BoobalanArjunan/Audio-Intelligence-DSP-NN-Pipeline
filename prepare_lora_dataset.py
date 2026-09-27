@@ -290,6 +290,60 @@ def sanitize(text):
     text = re.sub(r"[^\w\s-]", "", text).strip()
     return re.sub(r"[\s]+", "_", text)
 
+def save_mel_spectrogram(y, sr, output_path):
+    """
+    Generates and saves a high-res Mel-Spectrogram (the 2D image matrix
+    that Latent Diffusion models actually train on).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import librosa.display
+        
+        plt.figure(figsize=(10, 4))
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, fmax=8000)
+        S_dB = librosa.power_to_db(S, ref=np.max)
+        librosa.display.specshow(S_dB, x_axis='time', y_axis='mel', sr=sr, fmax=8000, cmap='magma')
+        plt.colorbar(format='%+2.0f dB')
+        plt.title('Mel-frequency spectrogram')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"Spectrogram failed: {e}")
+
+
+
+def detect_advanced_features(y, sr):
+    """
+    Extracts Harmonic vs Percussive classification and Transient Density.
+    """
+    # 1. Harmonic-Percussive Source Separation (HPSS)
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+    h_energy = np.mean(y_harmonic**2)
+    p_energy = np.mean(y_percussive**2)
+    
+    if p_energy > h_energy * 2:
+        audio_type = "Percussive"
+    elif h_energy > p_energy * 2:
+        audio_type = "Harmonic"
+    else:
+        audio_type = "Mixed"
+
+    # 2. Transient Density (Hits per second)
+    onsets = librosa.onset.onset_detect(y=y, sr=sr)
+    duration_sec = len(y) / sr
+    if duration_sec == 0: duration_sec = 1
+    density = len(onsets) / duration_sec
+    
+    if density > 4.5:
+        density_label = "Dense"
+    elif density < 1.5:
+        density_label = "Sparse"
+    else:
+        density_label = "Medium Density"
+        
+    return audio_type, density_label
+
 
 # ---------------------------------------------------------------------------
 # Main Pipeline (Generator — yields log lines to the GUI)
@@ -297,7 +351,7 @@ def sanitize(text):
 
 def process_directory(input_dir, output_dir, quarantine_dir,
                       dataset_name="BollyHood Beats", max_duration_s=TARGET_LOOP_SECONDS,
-                      manual_bpm=None):
+                      manual_bpm=None, enable_advanced=False):
     os.makedirs(output_dir,   exist_ok=True)
     os.makedirs(quarantine_dir, exist_ok=True)
 
@@ -385,11 +439,20 @@ def process_directory(input_dir, output_dir, quarantine_dir,
             vibe, centroid_hz = detect_vibe(y, sr)
             time_sig = detect_time_signature(audio_path=file_path)
 
+            # Advanced Features Optional Extraction
+            audio_type = "Unknown"
+            density_label = "Unknown"
+            if enable_advanced:
+                audio_type, density_label = detect_advanced_features(y, sr)
+
             # 6. Caption
             caption = (f"{dataset_name} {shape_tag}, {int(round(bpm))} BPM, {time_sig} time, "
                        f"Scale: {key_root} {key_mode}, Vibe: {vibe}")
+            
+            if enable_advanced:
+                caption += f", Type: {audio_type}, Density: {density_label}"
 
-            # 7. Smart rename
+            # 7. Smart rename (we omit advanced tags from filename to prevent it getting too long)
             stem = sanitize(Path(file_path).stem)
             safe_name = sanitize(dataset_name)
             key_safe  = key_root.replace("#", "sharp")
@@ -400,9 +463,12 @@ def process_directory(input_dir, output_dir, quarantine_dir,
             out_wav  = os.path.join(output_dir, f"{new_name}.wav")
             out_json = os.path.join(output_dir, f"{new_name}.json")
             out_txt  = os.path.join(output_dir, f"{new_name}.txt")
+            out_png  = os.path.join(output_dir, f"{new_name}_spectrogram.png")
 
             # 8. Write outputs
             sf.write(out_wav, y, sr)
+            if enable_advanced:
+                save_mel_spectrogram(y, sr, out_png)
 
             metadata = {
                 "caption":            caption,
@@ -417,6 +483,9 @@ def process_directory(input_dir, output_dir, quarantine_dir,
                 "spectral_vibe":      vibe,
                 "spectral_centroid_hz": centroid_hz,
             }
+            if enable_advanced:
+                metadata["audio_type"] = audio_type
+                metadata["transient_density"] = density_label
             with open(out_json, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
             with open(out_txt, "w", encoding="utf-8") as f:
